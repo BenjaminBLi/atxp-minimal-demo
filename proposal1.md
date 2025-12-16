@@ -21,3 +21,10 @@ Integration of Elicitation into the current codebase will require modifying the 
 ### Current questions:
 - does any data need to persist? currently no, as all requests are async and will run to completion
 - What about parallelization/performance due to the synchronous server calls? out of scope for first proposal
+
+
+Brief task list:
+- [ ] Implment mode validation
+- [ ] barebones url mode request to send to mcp client
+- [ ] update url mode request to use proper payments
+- [ ] implement basic notifications
