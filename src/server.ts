@@ -4,8 +4,34 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { BigNumber } from 'bignumber.js';
-import { requirePayment, ChainPaymentDestination } from '@atxp/server';
+import { requirePayment, ChainPaymentDestination, ATXPPaymentServer, PaymentServer } from '@atxp/server';
 import { atxpExpress } from '@atxp/express';
+import { ConsoleLogger, Logger } from '@atxp/common';
+
+// Custom logger that logs everything for debugging
+class DebugLogger implements Logger {
+  private baseLogger = new ConsoleLogger();
+  
+  debug(message: string): void {
+    console.log(`[DEBUG] ${message}`);
+    this.baseLogger.debug(message);
+  }
+  
+  info(message: string): void {
+    console.log(`[INFO] ${message}`);
+    this.baseLogger.info(message);
+  }
+  
+  warn(message: string): void {
+    console.warn(`[WARN] ${message}`);
+    this.baseLogger.warn(message);
+  }
+  
+  error(message: string): void {
+    console.error(`[ERROR] ${message}`);
+    this.baseLogger.error(message);
+  }
+}
 
 
 const getServer = () => {
@@ -23,7 +49,16 @@ const getServer = () => {
     },
     async ({ a, b }) => {
       // Require payment for the tool call
-      await requirePayment({price: BigNumber(0.01)});
+      try {
+        const price = BigNumber(0.01);
+        console.log(`[PAYMENT] Attempting to require payment: ${price.toString()}`);
+        await requirePayment({price: price});
+        console.log(`[PAYMENT] Payment successful`);
+      } catch (error) {
+        console.error(`[PAYMENT] Payment error:`, error);
+        console.error(`[PAYMENT] Error details:`, JSON.stringify(error, Object.getOwnPropertyNames(error)));
+        throw error;
+      }
       return {
         content: [
           {
@@ -42,15 +77,76 @@ const app = express();
 app.use(express.json());
 
 const destination = new ChainPaymentDestination('HQeMf9hmaus7gJhfBtPrPwPPsDLGfeVf8Aeri3uPP3Fy', 'base');
+const logger = new DebugLogger();
+
+// Create a payment server that transforms the charge format before sending
+// The API expects sourceAccountId and destinationAccountId, but requirePayment sends source and destinations
+const paymentServer = new ATXPPaymentServer('https://auth.atxp.ai', logger);
+
+// Override the charge method to transform the request format
+const originalCharge = paymentServer.charge.bind(paymentServer);
+paymentServer.charge = async function(chargeRequest: any) {
+  // Log the original request
+  console.log('[PAYMENT] Original charge request:', JSON.stringify(chargeRequest, null, 2));
+  
+  // Transform: Keep destinations (required by API), but add sourceAccountId and destinationAccountId
+  // The API expects: { sourceAccountId, destinationAccountId, destinations: [...], ... }
+  const transformedRequest: any = {
+    ...chargeRequest, // Keep all original fields including destinations
+    sourceAccountId: chargeRequest.source, // Add sourceAccountId
+    destinationAccountId: chargeRequest.destinations?.[0]?.address || chargeRequest.destination, // Add destinationAccountId
+  };
+  
+  // Remove the old 'source' field if we added sourceAccountId
+  if (transformedRequest.sourceAccountId) {
+    delete transformedRequest.source;
+  }
+  
+  console.log('[PAYMENT] Transformed charge request:', JSON.stringify(transformedRequest, null, 2));
+  
+  return originalCharge(transformedRequest);
+};
+
+// Override createPaymentRequest with the same transformation
+const originalCreatePaymentRequest = paymentServer.createPaymentRequest.bind(paymentServer);
+paymentServer.createPaymentRequest = async function(charge: any) {
+  // Keep destinations and add sourceAccountId/destinationAccountId
+  const transformedRequest: any = {
+    ...charge, // Keep all original fields including destinations
+    sourceAccountId: charge.source,
+    destinationAccountId: charge.destinations?.[0]?.address || charge.destination,
+  };
+  
+  // Remove the old 'source' field if we added sourceAccountId
+  if (transformedRequest.sourceAccountId) {
+    delete transformedRequest.source;
+  }
+  
+  return originalCreatePaymentRequest(transformedRequest);
+};
 
 app.use(atxpExpress({
   paymentDestination: destination,
   payeeName: 'ATXP Example Resource Server',
   allowHttp: true, // Only use in development
+  logger: logger, // Use custom logger for detailed debugging
+  paymentServer: paymentServer, // Use payment server with transformed charge method
 }));
 
 
 app.post('/', async (req: Request, res: Response) => {
+  // Log incoming request
+  console.log('[REQUEST]', {
+    method: req.method,
+    url: req.url,
+    path: req.path,
+    headers: req.headers,
+    body: req.body,
+    query: req.query,
+    ip: req.ip,
+    timestamp: new Date().toISOString(),
+  });
+
   const server = getServer();
   try {
     const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
@@ -58,14 +154,27 @@ app.post('/', async (req: Request, res: Response) => {
       enableJsonResponse: true
     });
     await server.connect(transport);
+    
+    // Log response when it's sent
+    const originalEnd = res.end;
+    res.end = function(chunk?: any, encoding?: any) {
+      console.log('[RESPONSE]', {
+        statusCode: res.statusCode,
+        headers: res.getHeaders(),
+        body: chunk ? (typeof chunk === 'string' ? chunk : chunk.toString()) : undefined,
+        timestamp: new Date().toISOString(),
+      });
+      return originalEnd.call(this, chunk, encoding);
+    };
+    
     await transport.handleRequest(req, res, req.body);
     res.on('close', () => {
-      console.log('Request closed');
+      console.log('[REQUEST] Request closed');
       transport.close();
       server.close();
     });
   } catch (error) {
-    console.error('Error handling MCP request:', error);
+    console.error('[ERROR] Error handling MCP request:', error);
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: '2.0',
