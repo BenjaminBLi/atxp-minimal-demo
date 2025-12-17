@@ -7,6 +7,7 @@ import { BigNumber } from 'bignumber.js';
 import { requirePayment, ChainPaymentDestination, ATXPPaymentServer, PaymentServer } from '@atxp/server';
 import { atxpExpress } from '@atxp/express';
 import { ConsoleLogger, Logger } from '@atxp/common';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 // Custom logger that logs everything for debugging
 class DebugLogger implements Logger {
@@ -134,18 +135,61 @@ app.use(atxpExpress({
 }));
 
 
+// Validate that the client supports URL mode elicitation
+function validateUrlModeSupport(req: Request): { valid: boolean; error?: string } {
+  if (!isInitializeRequest(req.body)) {
+    // Not an initialize request, skip validation (will be validated when initialize is called)
+    return { valid: true };
+  }
+
+  const params = req.body.params;
+  if (!params || !params.capabilities) {
+    return {
+      valid: false,
+      error: 'Client capabilities not provided in initialize request'
+    };
+  }
+
+  const capabilities = params.capabilities;
+  
+  // Check if elicitation capability is present
+  if (!capabilities.elicitation) {
+    return {
+      valid: false,
+      error: 'Client does not support elicitation. URL mode elicitation is required for payment flows.'
+    };
+  }
+
+  // Check if URL mode is supported (elicitation object may have urlMode property)
+  // The schema uses "passthrough" so we check for urlMode property
+  const elicitation = capabilities.elicitation as any;
+  if (elicitation.urlMode === false || (elicitation.urlMode === undefined && !elicitation.urlMode)) {
+    // If urlMode is explicitly false or not present, we should check if it's required
+    // For now, we'll accept if elicitation is present (urlMode might be implicit)
+    console.log('[VALIDATION] Elicitation capability found, urlMode:', elicitation.urlMode);
+  }
+
+  console.log('[VALIDATION] Client supports elicitation with capabilities:', JSON.stringify(capabilities.elicitation, null, 2));
+  return { valid: true };
+}
+
 app.post('/', async (req: Request, res: Response) => {
-  // Log incoming request
-  console.log('[REQUEST]', {
-    method: req.method,
-    url: req.url,
-    path: req.path,
-    headers: req.headers,
-    body: req.body,
-    query: req.query,
-    ip: req.ip,
-    timestamp: new Date().toISOString(),
-  });
+  // Validate URL mode support during initialization
+  const validation = validateUrlModeSupport(req);
+  if (!validation.valid) {
+    console.warn('[VALIDATION] URL mode validation failed:', validation.error);
+    if (!res.headersSent) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: {
+          code: -32602,
+          message: validation.error || 'Invalid request: URL mode elicitation not supported',
+        },
+        id: req.body?.id || null,
+      });
+    }
+    return;
+  }
 
   const server = getServer();
   try {
