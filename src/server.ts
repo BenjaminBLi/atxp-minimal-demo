@@ -4,9 +4,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import { BigNumber } from 'bignumber.js';
-import { requirePayment, ChainPaymentDestination, ATXPPaymentServer, PaymentServer } from '@atxp/server';
+import { requirePayment, ChainPaymentDestination, ATXPPaymentServer, getATXPConfig } from '@atxp/server';
 import { atxpExpress } from '@atxp/express';
-import { ConsoleLogger, Logger } from '@atxp/common';
+import { ConsoleLogger, Logger, PAYMENT_REQUIRED_ERROR_CODE } from '@atxp/common';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 // Custom logger that logs everything for debugging
@@ -48,18 +48,76 @@ const getServer = () => {
       a: z.number().describe("The first number to add"),
       b: z.number().describe("The second number to add"),
     },
-    async ({ a, b }) => {
+    async ({ a, b }, extra) => {
       // Require payment for the tool call
+      const price = BigNumber(0.01);
+      console.log(`[PAYMENT] Attempting to require payment: ${price.toString()}`);
+      
       try {
-        const price = BigNumber(0.01);
-        console.log(`[PAYMENT] Attempting to require payment: ${price.toString()}`);
         await requirePayment({price: price});
         console.log(`[PAYMENT] Payment successful`);
-      } catch (error) {
-        console.error(`[PAYMENT] Payment error:`, error);
-        console.error(`[PAYMENT] Error details:`, JSON.stringify(error, Object.getOwnPropertyNames(error)));
-        throw error;
+      } catch (error: any) {
+        // Check if this is a payment required error
+        if (error?.code === PAYMENT_REQUIRED_ERROR_CODE || error?.code === -30402) {
+          console.log(`[PAYMENT] Payment required`);
+          
+          // Extract payment information from error data
+          const paymentRequestUrl = error?.data?.paymentRequestUrl;
+          const paymentRequestId = error?.data?.paymentRequestId;
+          const chargeAmount = error?.data?.chargeAmount || price;
+          
+          if (!paymentRequestUrl || !paymentRequestId) {
+            console.error(`[PAYMENT] Missing payment information in error:`, error?.data);
+            throw error;
+          }
+
+          // Return elicitation requirement in structured format
+          // Since we can't send elicitation requests during active tool calls with HTTP transport,
+          // we return it in the tool response and the client will handle it as an elicitation
+          console.log(`[PAYMENT] Returning elicitation requirement with URL: ${paymentRequestUrl}`);
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Payment of $${chargeAmount.toString()} is required to use this tool.`,
+              },
+            ],
+            isError: false,
+            // Include elicitation information in structured format
+            _elicitation: {
+              message: `Payment of $${chargeAmount.toString()} is required to use this tool. Please approve the payment to continue.`,
+              requestedSchema: {
+                type: "object",
+                properties: {
+                  action: {
+                    type: "string",
+                    title: "Payment Action",
+                    description: "Choose whether to approve or decline the payment",
+                    enum: ["accept", "decline"],
+                    enumNames: ["Approve Payment", "Decline Payment"]
+                  },
+                  paymentUrl: {
+                    type: "string",
+                    title: "Payment URL",
+                    description: "URL to complete the payment",
+                    default: paymentRequestUrl
+                  }
+                },
+                required: ["action"]
+              },
+              paymentRequestUrl: paymentRequestUrl,
+              paymentRequestId: paymentRequestId,
+              chargeAmount: chargeAmount.toString()
+            }
+          };
+        } else {
+          // Not a payment error, rethrow
+          console.error(`[PAYMENT] Payment error:`, error);
+          throw error;
+        }
       }
+      
       return {
         content: [
           {
@@ -130,15 +188,13 @@ app.use(atxpExpress({
   paymentDestination: destination,
   payeeName: 'ATXP Example Resource Server',
   allowHttp: true, // Only use in development
-  logger: logger, // Use custom logger for detailed debugging
+  logger: logger, 
   paymentServer: paymentServer, // Use payment server with transformed charge method
 }));
 
 
-// Validate that the client supports URL mode elicitation
 function validateUrlModeSupport(req: Request): { valid: boolean; error?: string } {
   if (!isInitializeRequest(req.body)) {
-    // Not an initialize request, skip validation (will be validated when initialize is called)
     return { valid: true };
   }
 
@@ -173,6 +229,9 @@ function validateUrlModeSupport(req: Request): { valid: boolean; error?: string 
   return { valid: true };
 }
 
+// Store transports by session ID to share state between GET and POST requests
+const transportStore = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
+
 app.post('/', async (req: Request, res: Response) => {
   // Validate URL mode support during initialization
   const validation = validateUrlModeSupport(req);
@@ -191,14 +250,27 @@ app.post('/', async (req: Request, res: Response) => {
     return;
   }
 
-  const server = getServer();
-  try {
+  // Get or create transport for this session
+  const sessionId = req.headers['mcp-session-id'] as string || `session-${Date.now()}`;
+  let transportData = transportStore.get(sessionId);
+  
+  if (!transportData) {
+    const server = getServer();
     const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true
+      sessionIdGenerator: () => sessionId,
+      enableJsonResponse: false // Use SSE to allow server-initiated requests during tool calls
     });
     await server.connect(transport);
-    
+    transportData = { transport, server };
+    transportStore.set(sessionId, transportData);
+    console.log(`[SESSION] Created new transport for session: ${sessionId}`);
+  } else {
+    console.log(`[SESSION] Reusing transport for session: ${sessionId}`);
+  }
+  
+  const { transport, server } = transportData;
+  
+  try {
     // Log response when it's sent
     const originalEnd = res.end;
     res.end = function(chunk?: any, encoding?: any) {
@@ -213,9 +285,9 @@ app.post('/', async (req: Request, res: Response) => {
     
     await transport.handleRequest(req, res, req.body);
     res.on('close', () => {
-      console.log('[REQUEST] Request closed');
-      transport.close();
-      server.close();
+      console.log('[REQUEST] Request closed for session:', sessionId);
+      // Don't close transport/server here - they're shared across requests
+      // Only clean up if session is truly ended (would need session management)
     });
   } catch (error) {
     console.error('[ERROR] Error handling MCP request:', error);
@@ -233,15 +305,42 @@ app.post('/', async (req: Request, res: Response) => {
 });
 
 app.get('/', async (req: Request, res: Response) => {
-  console.log('Received GET MCP request');
-  res.writeHead(405).end(JSON.stringify({
-    jsonrpc: "2.0",
-    error: {
-      code: -32000,
-      message: "Method not allowed."
-    },
-    id: null
-  }));
+  console.log('[GET] Received GET MCP request for SSE stream');
+  
+  // Get or create transport for this session (same as POST)
+  const sessionId = req.headers['mcp-session-id'] as string || `session-${Date.now()}`;
+  let transportData = transportStore.get(sessionId);
+  
+  if (!transportData) {
+    const server = getServer();
+    const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => sessionId,
+      enableJsonResponse: false // Use SSE for GET requests
+    });
+    await server.connect(transport);
+    transportData = { transport, server };
+    transportStore.set(sessionId, transportData);
+    console.log(`[GET] Created new transport for session: ${sessionId}`);
+  } else {
+    console.log(`[GET] Reusing transport for session: ${sessionId}`);
+  }
+  
+  const { transport, server } = transportData;
+  
+  try {
+    // Handle the GET request - this will set up the SSE stream
+    await transport.handleRequest(req, res, undefined);
+    
+    res.on('close', () => {
+      console.log('[GET] SSE stream closed for session:', sessionId);
+      // Don't close transport/server here - they're shared
+    });
+  } catch (error) {
+    console.error('[GET] Error handling SSE stream:', error);
+    if (!res.headersSent) {
+      res.status(500).end();
+    }
+  }
 });
 
 app.delete('/', async (req: Request, res: Response) => {

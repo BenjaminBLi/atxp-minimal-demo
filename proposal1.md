@@ -24,7 +24,7 @@ Integration of Elicitation into the current codebase will require modifying the 
 
 
 Brief task list:
-- [ ] Implment mode validation
-- [ ] barebones url mode request to send to mcp client
-- [ ] update url mode request to use proper payments
+- [x] Implment mode validation
+- [x] barebones url mode request to send to mcp client
+- [x] update url mode request to use proper payments
 - [ ] implement basic notifications
