@@ -247,25 +247,14 @@ app.post('/', async (req: Request, res: Response) => {
 });
 
 app.get('/', async (req: Request, res: Response) => {
-  const server = getServer();
-  try {
-    const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: false
-    });
-    await server.connect(transport);
-    
-    await transport.handleRequest(req, res, undefined);
-    res.on('close', () => {
-      transport.close();
-      server.close();
-    });
-  } catch (error) {
-    console.error('[GET] Error handling SSE stream:', error);
-    if (!res.headersSent) {
-      res.status(500).end();
-    }
-  }
+  res.writeHead(405).end(JSON.stringify({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: "Method not allowed."
+    },
+    id: null
+  }));
 });
 
 app.delete('/', async (req: Request, res: Response) => {
