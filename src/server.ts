@@ -6,281 +6,178 @@ import { z } from 'zod';
 import { BigNumber } from 'bignumber.js';
 import { requirePayment, ChainPaymentDestination, ATXPPaymentServer } from '@atxp/server';
 import { atxpExpress } from '@atxp/express';
-import { ConsoleLogger, Logger, PAYMENT_REQUIRED_ERROR_CODE } from '@atxp/common';
+import { ConsoleLogger, PAYMENT_REQUIRED_ERROR_CODE } from '@atxp/common';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'node:crypto';
 
-// Custom logger that logs everything for debugging
-class DebugLogger implements Logger {
-  private baseLogger = new ConsoleLogger();
-  
-  debug(message: string): void {
-    console.log(`[DEBUG] ${message}`);
-    this.baseLogger.debug(message);
-  }
-  
-  info(message: string): void {
-    console.log(`[INFO] ${message}`);
-    this.baseLogger.info(message);
-  }
-  
-  warn(message: string): void {
-    console.warn(`[WARN] ${message}`);
-    this.baseLogger.warn(message);
-  }
-  
-  error(message: string): void {
-    console.error(`[ERROR] ${message}`);
-    this.baseLogger.error(message);
-  }
-}
 
+// Map to store server instances by session ID
+const serversBySession = new Map<string, McpServer>();
+// Map to store transport instances by session ID
+const transportsBySession = new Map<string, StreamableHTTPServerTransport>();
 
 const getServer = () => {
-  const server = new McpServer({
-    name: 'atxp-min-demo',
-    version: '1.0.0',
-  });
+  const server = new McpServer({ name: 'atxp-min-demo', version: '1.0.0' });
 
-  server.tool(
-    "add",
-    "Use this tool to add two numbers together.",
-    {
-      a: z.number().describe("The first number to add"),
-      b: z.number().describe("The second number to add"),
-    },
-    async ({ a, b }, extra) => {
-      // Require payment for the tool call
-      const price = BigNumber(0.01);
+  server.tool("add", "Add two numbers together.", {
+    a: z.number().describe("First number"),
+    b: z.number().describe("Second number"),
+  }, async ({ a, b }, extra) => {
+    const price = BigNumber(0.01);
+    
+    try {
+      await requirePayment({price});
+    } catch (error: any) {
+      if (error?.code !== PAYMENT_REQUIRED_ERROR_CODE && error?.code !== -30402) throw error;
       
+      const { paymentRequestUrl, paymentRequestId, chargeAmount = price } = error?.data || {};
+      if (!paymentRequestUrl || !paymentRequestId) throw error;
+
+      const sessionId = (extra as any)?.sessionId;
+      const serverInstance = serversBySession.get(sessionId);
+      if (!serverInstance) throw error;
+
       try {
-        await requirePayment({price: price});
-      } catch (error: any) {
-        // Check if this is a payment required error
-        if (error?.code === PAYMENT_REQUIRED_ERROR_CODE || error?.code === -30402) {
-          // Extract payment information from error data
-          const paymentRequestUrl = error?.data?.paymentRequestUrl;
-          const paymentRequestId = error?.data?.paymentRequestId;
-          const chargeAmount = error?.data?.chargeAmount || price;
-          
-          if (!paymentRequestUrl || !paymentRequestId) {
-            throw error;
-          }
+        const result = await serverInstance.server.elicitInput({
+          mode: 'url',
+          elicitationId: randomUUID(),
+          url: paymentRequestUrl,
+          message: `Payment of $${chargeAmount.toString()} is required. Please approve to continue.`
+        } as any);
 
-          // Return elicitation requirement in structured format
-          // Since we can't send elicitation requests during active tool calls with HTTP transport,
-          // we return it in the tool response and the client will handle it as an elicitation
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Payment of $${chargeAmount.toString()} is required to use this tool.`,
-              },
-            ],
-            isError: false,
-            _elicitation: {
-              message: `Payment of $${chargeAmount.toString()} is required to use this tool. Please approve the payment to continue.`,
-              requestedSchema: {
-                type: "object",
-                properties: {
-                  action: {
-                    type: "string",
-                    title: "Payment Action",
-                    description: "Choose whether to approve or decline the payment",
-                    enum: ["accept", "decline"],
-                    enumNames: ["Approve Payment", "Decline Payment"]
-                  },
-                  paymentUrl: {
-                    type: "string",
-                    title: "Payment URL",
-                    description: "URL to complete the payment",
-                    default: paymentRequestUrl
-                  }
-                },
-                required: ["action"]
-              },
-              paymentRequestUrl: paymentRequestUrl,
-              paymentRequestId: paymentRequestId,
-              chargeAmount: chargeAmount.toString()
-            }
-          };
+        if (result.action === 'accept') {
+          try {
+            await requirePayment({price});
+          } catch {
+            return {
+              content: [{ type: "text", text: `Payment not completed. Please complete at ${paymentRequestUrl}` }],
+              isError: true,
+            };
+          }
         } else {
-          throw error;
+          return {
+            content: [{ type: "text", text: "Payment declined. Tool cannot execute without payment." }],
+            isError: true,
+          };
         }
+      } catch {
+        throw error;
       }
-      
-      return {
-        content: [
-          {
-            type: "text",
-            text: `${a + b}`,
-          },
-        ],
-      };
     }
-  );
+    
+    return { content: [{ type: "text", text: `${a + b}` }] };
+  });
 
   return server;
 }
 
 const app = express();
+// Parse JSON for POST requests
 app.use(express.json());
 
-const destination = new ChainPaymentDestination('HQeMf9hmaus7gJhfBtPrPwPPsDLGfeVf8Aeri3uPP3Fy', 'base');
-const logger = new DebugLogger();
-
-// Create a payment server that transforms the charge format before sending
-// The API expects sourceAccountId and destinationAccountId, but requirePayment sends source and destinations
+const logger = new ConsoleLogger();
 const paymentServer = new ATXPPaymentServer('https://auth.atxp.ai', logger);
 
-// Transform charge requests to match API format
-const originalCharge = paymentServer.charge.bind(paymentServer);
-paymentServer.charge = async function(chargeRequest: any) {
-  const transformedRequest: any = {
-    ...chargeRequest,
-    sourceAccountId: chargeRequest.source,
-    destinationAccountId: chargeRequest.destinations?.[0]?.address || chargeRequest.destination,
+// Transform API format: source/destinations -> sourceAccountId/destinationAccountId
+const transformRequest = (req: any) => {
+  const transformed = {
+    ...req,
+    sourceAccountId: req.source,
+    destinationAccountId: req.destinations?.[0]?.address || req.destination,
   };
-  
-  if (transformedRequest.sourceAccountId) {
-    delete transformedRequest.source;
-  }
-  
-  return originalCharge(transformedRequest);
+  if (transformed.sourceAccountId) delete transformed.source;
+  return transformed;
 };
 
-// Transform payment request creation to match API format
+const originalCharge = paymentServer.charge.bind(paymentServer);
+paymentServer.charge = async (req: any) => originalCharge(transformRequest(req));
+
 const originalCreatePaymentRequest = paymentServer.createPaymentRequest.bind(paymentServer);
-paymentServer.createPaymentRequest = async function(charge: any) {
-  const transformedRequest: any = {
-    ...charge,
-    sourceAccountId: charge.source,
-    destinationAccountId: charge.destinations?.[0]?.address || charge.destination,
-  };
-  
-  if (transformedRequest.sourceAccountId) {
-    delete transformedRequest.source;
-  }
-  
-  return originalCreatePaymentRequest(transformedRequest);
-};
+paymentServer.createPaymentRequest = async (req: any) => originalCreatePaymentRequest(transformRequest(req));
 
 app.use(atxpExpress({
-  paymentDestination: destination,
+  paymentDestination: new ChainPaymentDestination('HQeMf9hmaus7gJhfBtPrPwPPsDLGfeVf8Aeri3uPP3Fy', 'base'),
   payeeName: 'ATXP Example Resource Server',
-  allowHttp: true, // Only use in development
-  logger: logger, 
-  paymentServer: paymentServer, // Use payment server with transformed charge method
+  allowHttp: true,
+  logger,
+  paymentServer,
 }));
 
 
-function validateUrlModeSupport(req: Request): { valid: boolean; error?: string } {
-  if (!isInitializeRequest(req.body)) {
-    return { valid: true };
+const validateElicitation = (req: Request) => {
+  if (!isInitializeRequest(req.body)) return null;
+  if (!req.body.params?.capabilities?.elicitation) {
+    return 'Client does not support elicitation. URL mode elicitation is required.';
   }
-
-  const params = req.body.params;
-  if (!params || !params.capabilities) {
-    return {
-      valid: false,
-      error: 'Client capabilities not provided in initialize request'
-    };
-  }
-
-  const capabilities = params.capabilities;
-  
-  // Check if elicitation capability is present
-  if (!capabilities.elicitation) {
-    return {
-      valid: false,
-      error: 'Client does not support elicitation. URL mode elicitation is required for payment flows.'
-    };
-  }
-
-  // Client supports elicitation - that's sufficient for our use case
-  return { valid: true };
-}
+  return null;
+};
 
 app.post('/', async (req: Request, res: Response) => {
-  // Validate elicitation support during initialization
-  const validation = validateUrlModeSupport(req);
-  if (!validation.valid) {
-    console.warn('[VALIDATION] Validation failed:', validation.error);
-    if (!res.headersSent) {
-      res.status(400).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32602,
-          message: validation.error || 'Invalid request: elicitation not supported',
-        },
-        id: req.body?.id || null,
-      });
-    }
-    return;
+  const error = validateElicitation(req);
+  if (error && !res.headersSent) {
+    return res.status(400).json({ jsonrpc: '2.0', error: { code: -32602, message: error }, id: req.body?.id || null });
   }
 
-  const server = getServer();
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  const isInit = isInitializeRequest(req.body);
+
+  console.log(`[POST] Session ID: ${sessionId || 'none'}, Is Init: ${isInit}`);
+  console.log(`[POST] Available sessions:`, Array.from(transportsBySession.keys()));
+
   try {
-    const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: false
-    });
-    await server.connect(transport);
-    
-    await transport.handleRequest(req, res, req.body);
-    res.on('close', () => {
-      transport.close();
-      server.close();
-    });
-  } catch (error) {
-    console.error('[ERROR] Error handling MCP request:', error);
-    if (!res.headersSent) {
-      res.status(500).json({
-        jsonrpc: '2.0',
-        error: {
-          code: -32603,
-          message: 'Internal server error',
-        },
-        id: null,
+    let server: McpServer, transport: StreamableHTTPServerTransport;
+
+    if (sessionId && transportsBySession.has(sessionId)) {
+      transport = transportsBySession.get(sessionId)!;
+      server = serversBySession.get(sessionId)!;
+      console.log(`[POST] Reusing existing session: ${sessionId}`);
+    } else if (!sessionId && isInit) {
+      console.log(`[POST] Creating new session (initialize)`);
+      server = getServer();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        enableJsonResponse: false,
+        onsessioninitialized: (sid: string) => {
+          if (sid) {
+            serversBySession.set(sid, server);
+            transportsBySession.set(sid, transport);
+            console.log(`[POST] Session initialized: ${sid}`);
+          }
+        }
       });
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          transportsBySession.delete(sid);
+          serversBySession.delete(sid);
+          console.log(`[POST] Session closed: ${sid}`);
+        }
+      };
+      await server.connect(transport);
+    } else {
+      console.error(`[POST] Bad Request - Session ID: ${sessionId}, Is Init: ${isInit}, Has Session: ${sessionId ? transportsBySession.has(sessionId) : 'N/A'}`);
+      return res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request' }, id: req.body?.id || null });
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error(`[POST] Error:`, error);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
     }
   }
 });
 
-app.get('/', async (req: Request, res: Response) => {
-  res.writeHead(405).end(JSON.stringify({
-    jsonrpc: "2.0",
-    error: {
-      code: -32000,
-      message: "Method not allowed."
-    },
-    id: null
-  }));
-});
-
-app.delete('/', async (req: Request, res: Response) => {
-  console.log('Received DELETE MCP request');
-  res.writeHead(405).end(JSON.stringify({
-    jsonrpc: "2.0",
-    error: {
-      code: -32000,
-      message: "Method not allowed."
-    },
-    id: null
-  }));
-});
+app.get('/', (req, res) => res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null }));
+app.delete('/', (req, res) => res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null }));
 
 
-// Start the server
 app.listen(3000, (error) => {
   if (error) {
     console.error('Failed to start server:', error);
     process.exit(1);
   }
-  console.log(`ATXP Minimal Demo listening on port 3000`);
+  console.log('ATXP Minimal Demo listening on port 3000');
 });
 
-// Handle server shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down server...');
-  process.exit(0);
-});
+process.on('SIGINT', () => process.exit(0));
