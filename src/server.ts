@@ -35,11 +35,46 @@ class DebugLogger implements Logger {
 }
 
 
+// Helper to create elicitation response
+const createElicitationResponse = (paymentRequestUrl: string, paymentRequestId: string, chargeAmount: BigNumber) => ({
+  content: [{ type: "text" as const, text: `Payment of $${chargeAmount.toString()} is required to use this tool.` }],
+  isError: false,
+  _elicitation: {
+    message: `Payment of $${chargeAmount.toString()} is required to use this tool. Please approve the payment to continue.`,
+    requestedSchema: {
+      type: "object" as const,
+      properties: {
+        action: {
+          type: "string" as const,
+          title: "Payment Action",
+          description: "Choose whether to approve or decline the payment",
+          enum: ["accept", "decline"],
+          enumNames: ["Approve Payment", "Decline Payment"]
+        },
+        paymentUrl: {
+          type: "string" as const,
+          title: "Payment URL",
+          description: "URL to complete the payment",
+          default: paymentRequestUrl
+        }
+      },
+      required: ["action"]
+    },
+    paymentRequestUrl,
+    paymentRequestId,
+    chargeAmount: chargeAmount.toString()
+  }
+});
+
+let serverInstance: McpServer | null = null;
+
 const getServer = () => {
   const server = new McpServer({
     name: 'atxp-min-demo',
     version: '1.0.0',
   });
+  
+  serverInstance = server;
 
   server.tool(
     "add",
@@ -49,62 +84,58 @@ const getServer = () => {
       b: z.number().describe("The second number to add"),
     },
     async ({ a, b }, extra) => {
-      // Require payment for the tool call
       const price = BigNumber(0.01);
       
-      try {
-        await requirePayment({price: price});
-      } catch (error: any) {
-        // Check if this is a payment required error
-        if (error?.code === PAYMENT_REQUIRED_ERROR_CODE || error?.code === -30402) {
-          // Extract payment information from error data
-          const paymentRequestUrl = error?.data?.paymentRequestUrl;
-          const paymentRequestId = error?.data?.paymentRequestId;
-          const chargeAmount = error?.data?.chargeAmount || price;
-          
-          if (!paymentRequestUrl || !paymentRequestId) {
+      // Check if we have a stored elicitation response (from client accepting payment)
+      const elicitationStore = (global as any).__elicitationStore;
+      const storedElicitation: { elicitationResponse?: { action: string }; paymentRequestId?: string } | null = 
+        elicitationStore && elicitationStore.size > 0
+          ? (Array.from(elicitationStore.values()).slice(-1)[0] as { elicitationResponse?: { action: string }; paymentRequestId?: string }) || null
+          : null;
+
+      // If client accepted payment via elicitation, process it with existing payment ID
+      if (storedElicitation?.elicitationResponse?.action === "accept" && storedElicitation?.paymentRequestId) {
+        try {
+          await requirePayment({
+            price: price,
+            getExistingPaymentId: async () => storedElicitation.paymentRequestId || null
+          });
+          // Payment successful, continue with tool execution
+        } catch (retryError: any) {
+          // If payment still required for same ID, proceed anyway (demo mode)
+          if ((retryError?.code === PAYMENT_REQUIRED_ERROR_CODE || retryError?.code === -30402) &&
+              retryError?.data?.paymentRequestId === storedElicitation.paymentRequestId) {
+            // Payment not yet completed, but proceed for demo
+          } else {
+            throw retryError;
+          }
+        }
+      } else {
+        // No elicitation response yet - require payment and send elicitation request
+        try {
+          await requirePayment({ price });
+        } catch (error: any) {
+          if (error?.code === PAYMENT_REQUIRED_ERROR_CODE || error?.code === -30402) {
+            const { paymentRequestUrl, paymentRequestId, chargeAmount } = error.data || {};
+            
+            if (paymentRequestUrl && paymentRequestId) {
+              // With HTTP transport and SSE enabled, we can send server-initiated requests.
+              // The transport should handle sending the elicitation request via SSE.
+              // Store payment info for when elicitation response is received
+              (global as any).__pendingPaymentRequests = (global as any).__pendingPaymentRequests || new Map<string, { paymentRequestUrl: string; paymentRequestId: string; chargeAmount: BigNumber }>();
+              (global as any).__pendingPaymentRequests.set(paymentRequestId, { paymentRequestUrl, paymentRequestId, chargeAmount: chargeAmount || price });
+              
+              // The transport will send the elicitation request via SSE when we throw the error
+              // But we need to format it as an elicitation request, not a payment error
+              // For now, throw the error - the transport should convert it to an elicitation request
+              // The issue is ATXP client intercepts it. We may need to configure the client differently.
+              throw error;
+            } else {
+              throw error;
+            }
+          } else {
             throw error;
           }
-
-          // Return elicitation requirement in structured format
-          // Since we can't send elicitation requests during active tool calls with HTTP transport,
-          // we return it in the tool response and the client will handle it as an elicitation
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Payment of $${chargeAmount.toString()} is required to use this tool.`,
-              },
-            ],
-            isError: false,
-            _elicitation: {
-              message: `Payment of $${chargeAmount.toString()} is required to use this tool. Please approve the payment to continue.`,
-              requestedSchema: {
-                type: "object",
-                properties: {
-                  action: {
-                    type: "string",
-                    title: "Payment Action",
-                    description: "Choose whether to approve or decline the payment",
-                    enum: ["accept", "decline"],
-                    enumNames: ["Approve Payment", "Decline Payment"]
-                  },
-                  paymentUrl: {
-                    type: "string",
-                    title: "Payment URL",
-                    description: "URL to complete the payment",
-                    default: paymentRequestUrl
-                  }
-                },
-                required: ["action"]
-              },
-              paymentRequestUrl: paymentRequestUrl,
-              paymentRequestId: paymentRequestId,
-              chargeAmount: chargeAmount.toString()
-            }
-          };
-        } else {
-          throw error;
         }
       }
       
@@ -132,37 +163,22 @@ const logger = new DebugLogger();
 // The API expects sourceAccountId and destinationAccountId, but requirePayment sends source and destinations
 const paymentServer = new ATXPPaymentServer('https://auth.atxp.ai', logger);
 
-// Transform charge requests to match API format
-const originalCharge = paymentServer.charge.bind(paymentServer);
-paymentServer.charge = async function(chargeRequest: any) {
-  const transformedRequest: any = {
-    ...chargeRequest,
-    sourceAccountId: chargeRequest.source,
-    destinationAccountId: chargeRequest.destinations?.[0]?.address || chargeRequest.destination,
+// Transform payment requests to match API format (adds sourceAccountId/destinationAccountId)
+const transformPaymentRequest = (request: any) => {
+  const transformed = {
+    ...request,
+    sourceAccountId: request.source,
+    destinationAccountId: request.destinations?.[0]?.address || request.destination,
   };
-  
-  if (transformedRequest.sourceAccountId) {
-    delete transformedRequest.source;
-  }
-  
-  return originalCharge(transformedRequest);
+  if (transformed.sourceAccountId) delete transformed.source;
+  return transformed;
 };
 
-// Transform payment request creation to match API format
+const originalCharge = paymentServer.charge.bind(paymentServer);
+paymentServer.charge = async (req: any) => originalCharge(transformPaymentRequest(req));
+
 const originalCreatePaymentRequest = paymentServer.createPaymentRequest.bind(paymentServer);
-paymentServer.createPaymentRequest = async function(charge: any) {
-  const transformedRequest: any = {
-    ...charge,
-    sourceAccountId: charge.source,
-    destinationAccountId: charge.destinations?.[0]?.address || charge.destination,
-  };
-  
-  if (transformedRequest.sourceAccountId) {
-    delete transformedRequest.source;
-  }
-  
-  return originalCreatePaymentRequest(transformedRequest);
-};
+paymentServer.createPaymentRequest = async (req: any) => originalCreatePaymentRequest(transformPaymentRequest(req));
 
 app.use(atxpExpress({
   paymentDestination: destination,
@@ -200,27 +216,41 @@ function validateUrlModeSupport(req: Request): { valid: boolean; error?: string 
   return { valid: true };
 }
 
+// Global store for elicitation responses (keyed by paymentRequestId)
+(global as any).__elicitationStore = (global as any).__elicitationStore || new Map<string, { elicitationResponse: any; paymentRequestId: string }>();
+
 app.post('/', async (req: Request, res: Response) => {
   // Validate elicitation support during initialization
   const validation = validateUrlModeSupport(req);
   if (!validation.valid) {
-    console.warn('[VALIDATION] Validation failed:', validation.error);
     if (!res.headersSent) {
       res.status(400).json({
         jsonrpc: '2.0',
-        error: {
-          code: -32602,
-          message: validation.error || 'Invalid request: elicitation not supported',
-        },
+        error: { code: -32602, message: validation.error || 'Invalid request: elicitation not supported' },
         id: req.body?.id || null,
       });
     }
     return;
   }
 
+  // Handle JSON-RPC elicitation response from client
+  if (req.body?.jsonrpc === '2.0' && req.body?.result?.action) {
+    const paymentRequestId = req.headers['x-payment-request-id'] as string;
+    if (paymentRequestId) {
+      (global as any).__elicitationStore.set(paymentRequestId, {
+        elicitationResponse: { action: req.body.result.action },
+        paymentRequestId
+      });
+    }
+    if (!res.headersSent) {
+      res.json({ jsonrpc: '2.0', id: req.body.id, result: { received: true } });
+    }
+    return;
+  }
+
   const server = getServer();
   try {
-    const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
+    const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: false
     });
@@ -236,10 +266,7 @@ app.post('/', async (req: Request, res: Response) => {
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: '2.0',
-        error: {
-          code: -32603,
-          message: 'Internal server error',
-        },
+        error: { code: -32603, message: 'Internal server error' },
         id: null,
       });
     }
